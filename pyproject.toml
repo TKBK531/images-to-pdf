@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "images-to-pdf"
-version = "1.0.0"
+version = "1.1.0"
 description = "Desktop app that converts a folder or selection of images into a single PDF."
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0"]
+dev = ["pytest>=7.0"]
 
 [project.gui-scripts]
 images-to-pdf = "images_to_pdf.app:main"

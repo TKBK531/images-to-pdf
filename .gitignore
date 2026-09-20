@@ -6,4 +6,8 @@ build/
 dist/
 *.spec
 *.egg-info/
+icon.ico
+icon.icns
+.pytest_cache/
+.claude/
 legacy/

@@ -4,42 +4,34 @@ Images → PDF  (enhanced edition)
 Features
 ────────
 • Multi-folder support     – add images from many folders into one PDF
-• Drag-to-reorder list     – rearrange pages before converting (keyboard ↑↓ too)
+• Drag-to-reorder list     – click and drag rows, or use ↑/↓ (keyboard too)
 • Remove individual items  – delete unwanted pages from the list
 • Per-image rotation       – rotate any page 0 / 90 / 180 / 270 ° (right-click menu)
-• JPEG quality slider      – trade file size vs. sharpness
+• Thumbnail previews       – see each page, not just its filename
+• JPEG quality slider, or lossless PNG — trade file size vs. sharpness
 • Page-size options        – Fit-to-image | A4 | Letter | A3 | A5 (centred on white)
 • Duplicate detection      – MD5 hash check; warns but still lets you proceed
 • Gap / sequence report    – shown in log when numeric naming is used
 • EXIF auto-rotation       – portrait photos stay upright
 • RGBA / palette fix       – transparent PNGs & GIFs convert cleanly
-• Cancel mid-conversion    – cleans up partial PDF
+• Remembers your last output folder, quality, page size and format
+• Cancel mid-conversion    – nothing is written to disk until the PDF is complete
 • Open PDF or folder after – success dialog offers both
 """
 
 import os
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 
-from PIL import Image
+from PIL import ImageTk
 from reportlab.lib.pagesizes import A3, A4, A5, letter
-from reportlab.pdfgen import canvas
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .core import (
-    PageItem,
-    SUPPORTED_EXTS,
-    collect_images,
-    find_gaps,
-    fix_image,
-    format_size,
-    md5_of,
-    rotate_pil,
-)
+from . import core
+from .core import PageItem, SUPPORTED_EXTS, collect_images, find_gaps
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -76,10 +68,13 @@ class App(tk.Tk):
         self.title("Images → PDF")
         self.resizable(False, False)
         self.configure(bg=DARK_BG)
-        self._center(580, 860)
+        self._center(600, 940)
         self._cancel_flag = threading.Event()
         self._items: list[PageItem] = []
+        self._drag_iid = None
+        self._settings = core.load_settings()
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _center(self, w, h):
         self.update_idletasks()
@@ -91,6 +86,9 @@ class App(tk.Tk):
     def _build(self):
         root = tk.Frame(self, bg=DARK_BG)
         root.pack(fill="both", expand=True, padx=24, pady=20)
+
+        self._style = ttk.Style(self)
+        self._style.theme_use("default")
 
         tk.Label(
             root,
@@ -123,40 +121,54 @@ class App(tk.Tk):
         )
         self._flat_button(add_row, "+ Add files", self._add_files).pack(side="left")
 
-        # ── Page list ──
+        # ── Page list (thumbnail + name, drag or ↑/↓ to reorder) ──
         list_frame = tk.Frame(
             root, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1
         )
         list_frame.pack(fill="x", pady=(4, 2))
-        self._listbox = tk.Listbox(
-            list_frame,
+
+        self._style.configure(
+            "Pages.Treeview",
+            background=CARD_BG,
+            fieldbackground=CARD_BG,
+            foreground=TEXT_PRI,
+            borderwidth=0,
+            rowheight=52,
             font=FONT_MONO,
-            bg=CARD_BG,
-            fg=TEXT_PRI,
-            selectbackground=ACCENT,
-            selectforeground="#fff",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            activestyle="none",
-            height=9,
         )
+        self._style.map(
+            "Pages.Treeview",
+            background=[("selected", ACCENT)],
+            foreground=[("selected", "#fff")],
+        )
+
+        self._tree = ttk.Treeview(
+            list_frame,
+            style="Pages.Treeview",
+            show="tree",
+            selectmode="extended",
+            height=5,
+        )
+        self._tree.column("#0", stretch=True)
         lscroll = tk.Scrollbar(
             list_frame,
-            command=self._listbox.yview,
+            command=self._tree.yview,
             bg=CARD_BG,
             troughcolor=CARD_BG,
             activebackground=BORDER,
             relief="flat",
             bd=0,
         )
-        self._listbox.configure(yscrollcommand=lscroll.set)
-        self._listbox.pack(side="left", fill="both", expand=True, padx=2, pady=4)
+        self._tree.configure(yscrollcommand=lscroll.set)
+        self._tree.pack(side="left", fill="both", expand=True, padx=2, pady=4)
         lscroll.pack(side="right", fill="y", pady=4)
-        self._listbox.bind("<Button-3>", self._ctx_menu)
-        self._listbox.bind("<Button-2>", self._ctx_menu)
-        self._listbox.bind("<Up>", lambda e: self._move(-1))
-        self._listbox.bind("<Down>", lambda e: self._move(1))
+        self._tree.bind("<Button-3>", self._ctx_menu)
+        self._tree.bind("<Button-2>", self._ctx_menu)
+        self._tree.bind("<Up>", self._on_key_up)
+        self._tree.bind("<Down>", self._on_key_down)
+        self._tree.bind("<ButtonPress-1>", self._on_drag_start)
+        self._tree.bind("<B1-Motion>", self._on_drag_motion)
+        self._tree.bind("<ButtonRelease-1>", self._on_drag_end)
 
         act_row = tk.Frame(root, bg=DARK_BG)
         act_row.pack(fill="x", pady=(2, 12))
@@ -193,7 +205,9 @@ class App(tk.Tk):
             if sys.platform == "win32"
             else os.path.expanduser("~/Desktop")
         )
-        self.outdir_var = tk.StringVar(value=default_out)
+        self.outdir_var = tk.StringVar(
+            value=self._settings.get("output_dir") or default_out
+        )
         tk.Entry(
             out_frame,
             textvariable=self.outdir_var,
@@ -248,34 +262,19 @@ class App(tk.Tk):
         tk.Label(
             inner, text="Page size", font=FONT_SMALL, bg=CARD_BG, fg=TEXT_SEC
         ).grid(row=0, column=0, sticky="w")
-        self.pagesize_var = tk.StringVar(value="Fit to image")
+        saved_page_size = self._settings.get("page_size")
+        self.pagesize_var = tk.StringVar(
+            value=saved_page_size if saved_page_size in PAGE_SIZES else "Fit to image"
+        )
         ps_menu = tk.OptionMenu(inner, self.pagesize_var, *PAGE_SIZES.keys())
-        ps_menu.config(
-            font=FONT_SMALL,
-            bg=CARD_BG,
-            fg=TEXT_PRI,
-            activebackground=ACCENT,
-            activeforeground="#fff",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        ps_menu["menu"].config(
-            font=FONT_SMALL,
-            bg=CARD_BG,
-            fg=TEXT_PRI,
-            activebackground=ACCENT,
-            activeforeground="#fff",
-            relief="flat",
-        )
+        self._style_optionmenu(ps_menu)
         ps_menu.grid(row=0, column=1, sticky="w", padx=(8, 32))
 
         tk.Label(
             inner, text="JPEG quality", font=FONT_SMALL, bg=CARD_BG, fg=TEXT_SEC
         ).grid(row=0, column=2, sticky="w")
-        self._quality_var = tk.IntVar(value=90)
-        tk.Scale(
+        self._quality_var = tk.IntVar(value=self._settings.get("quality", 90))
+        self._quality_scale = tk.Scale(
             inner,
             variable=self._quality_var,
             from_=30,
@@ -290,7 +289,8 @@ class App(tk.Tk):
             relief="flat",
             bd=0,
             cursor="hand2",
-        ).grid(row=0, column=3, sticky="w", padx=(8, 6))
+        )
+        self._quality_scale.grid(row=0, column=3, sticky="w", padx=(8, 6))
         self._q_label = tk.Label(
             inner, text="90", font=FONT_SMALL, bg=CARD_BG, fg=ACCENT, width=3
         )
@@ -299,15 +299,24 @@ class App(tk.Tk):
             "write", lambda *_: self._q_label.config(text=str(self._quality_var.get()))
         )
 
+        tk.Label(
+            inner, text="Format", font=FONT_SMALL, bg=CARD_BG, fg=TEXT_SEC
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        initial_format = "PNG (lossless)" if self._settings.get("image_format") == "png" else "JPEG"
+        self.format_var = tk.StringVar(value=initial_format)
+        fmt_menu = tk.OptionMenu(inner, self.format_var, "JPEG", "PNG (lossless)")
+        self._style_optionmenu(fmt_menu)
+        fmt_menu.grid(row=1, column=1, sticky="w", padx=(8, 32), pady=(10, 0))
+        self.format_var.trace_add("write", self._on_format_change)
+        self._on_format_change()
+
         # ── Progress ──
         self._section(root, "PROGRESS")
         prog_card = tk.Frame(
             root, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1
         )
         prog_card.pack(fill="x", pady=(4, 4))
-        style = ttk.Style(self)
-        style.theme_use("default")
-        style.configure(
+        self._style.configure(
             "Bar.Horizontal.TProgressbar",
             troughcolor=BORDER,
             background=ACCENT,
@@ -441,6 +450,31 @@ class App(tk.Tk):
         btn.bind("<Leave>", lambda e: btn.config(bg=BORDER, fg=TEXT_PRI))
         return btn
 
+    def _style_optionmenu(self, menu):
+        menu.config(
+            font=FONT_SMALL,
+            bg=CARD_BG,
+            fg=TEXT_PRI,
+            activebackground=ACCENT,
+            activeforeground="#fff",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        menu["menu"].config(
+            font=FONT_SMALL,
+            bg=CARD_BG,
+            fg=TEXT_PRI,
+            activebackground=ACCENT,
+            activeforeground="#fff",
+            relief="flat",
+        )
+
+    def _on_format_change(self, *_):
+        is_png = self.format_var.get().startswith("PNG")
+        self._quality_scale.config(state="disabled" if is_png else "normal")
+
     def _make_filename(self):
         return f"output_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.pdf"
 
@@ -467,12 +501,49 @@ class App(tk.Tk):
             self._prog_var.set(pct)
             self._pct_label.config(text=f"{pct:.0f}%")
 
+    def _current_settings(self):
+        return {
+            "output_dir": self.outdir_var.get().strip() or None,
+            "quality": self._quality_var.get(),
+            "page_size": self.pagesize_var.get(),
+            "image_format": "png" if self.format_var.get().startswith("PNG") else "jpeg",
+        }
+
+    def _on_close(self):
+        core.save_settings(self._current_settings())
+        self.destroy()
+
     # ── List management ───────────────────────────────────────────────────────
 
-    def _refresh_list(self):
-        self._listbox.delete(0, "end")
+    def _thumbnail_for(self, item):
+        try:
+            pil_img = core.make_thumbnail(item.path, item.rotation)
+            item.thumbnail = ImageTk.PhotoImage(pil_img)
+        except Exception:
+            item.thumbnail = None
+        return item.thumbnail
+
+    def _index_of_id(self, iid):
+        for idx, item in enumerate(self._items):
+            if item.id == iid:
+                return idx
+        return None
+
+    def _selected_index(self):
+        sel = self._tree.selection()
+        if not sel:
+            return None
+        return self._index_of_id(sel[0])
+
+    def _selected_indices(self):
+        ids = set(self._tree.selection())
+        return [i for i, item in enumerate(self._items) if item.id in ids]
+
+    def _refresh_list(self, select_id=None):
+        self._tree.delete(*self._tree.get_children())
         for item in self._items:
-            self._listbox.insert("end", item.display())
+            thumb = item.thumbnail if item.thumbnail is not None else self._thumbnail_for(item)
+            self._tree.insert("", "end", iid=item.id, text=item.display(), image=thumb)
         n = len(self._items)
         self._list_hint.config(
             text=(
@@ -482,6 +553,9 @@ class App(tk.Tk):
             ),
             fg=TEXT_PRI if n else TEXT_SEC,
         )
+        if select_id and self._tree.exists(select_id):
+            self._tree.selection_set(select_id)
+            self._tree.focus(select_id)
 
     def _add_folder(self):
         folder = filedialog.askdirectory(title="Select image folder")
@@ -521,10 +595,10 @@ class App(tk.Tk):
         self._log_write(f"  +  Added {len(paths)} file(s)", "info")
 
     def _remove_selected(self):
-        sel = self._listbox.curselection()
-        if not sel:
+        idxs = self._selected_indices()
+        if not idxs:
             return
-        for idx in reversed(sel):
+        for idx in sorted(idxs, reverse=True):
             del self._items[idx]
         self._refresh_list()
 
@@ -537,27 +611,55 @@ class App(tk.Tk):
         self._refresh_list()
 
     def _move(self, direction):
-        sel = self._listbox.curselection()
-        if not sel:
+        idx = self._selected_index()
+        if idx is None:
             return
-        idx = sel[0]
         new_idx = idx + direction
         if new_idx < 0 or new_idx >= len(self._items):
             return
         self._items[idx], self._items[new_idx] = self._items[new_idx], self._items[idx]
-        self._refresh_list()
-        self._listbox.selection_set(new_idx)
-        self._listbox.activate(new_idx)
-        self._listbox.see(new_idx)
+        self._refresh_list(select_id=self._items[new_idx].id)
+
+    def _on_key_up(self, event):
+        self._move(-1)
+        return "break"
+
+    def _on_key_down(self, event):
+        self._move(1)
+        return "break"
+
+    # ── Drag-to-reorder ───────────────────────────────────────────────────────
+
+    def _on_drag_start(self, event):
+        self._drag_iid = self._tree.identify_row(event.y)
+
+    def _on_drag_motion(self, event):
+        if not self._drag_iid:
+            return
+        target_iid = self._tree.identify_row(event.y)
+        if not target_iid or target_iid == self._drag_iid:
+            return
+        from_idx = self._index_of_id(self._drag_iid)
+        to_idx = self._index_of_id(target_iid)
+        if from_idx is None or to_idx is None or from_idx == to_idx:
+            return
+        item = self._items.pop(from_idx)
+        self._items.insert(to_idx, item)
+        self._tree.move(self._drag_iid, "", to_idx)
+
+    def _on_drag_end(self, event):
+        self._drag_iid = None
 
     # ── Right-click menu ──────────────────────────────────────────────────────
 
     def _ctx_menu(self, event):
-        idx = self._listbox.nearest(event.y)
-        if idx < 0 or idx >= len(self._items):
+        iid = self._tree.identify_row(event.y)
+        if not iid:
             return
-        self._listbox.selection_clear(0, "end")
-        self._listbox.selection_set(idx)
+        self._tree.selection_set(iid)
+        idx = self._index_of_id(iid)
+        if idx is None:
+            return
         item = self._items[idx]
 
         menu = tk.Menu(
@@ -595,9 +697,10 @@ class App(tk.Tk):
         menu.tk_popup(event.x_root, event.y_root)
 
     def _set_rotation(self, idx, degrees):
-        self._items[idx].rotation = degrees
-        self._refresh_list()
-        self._listbox.selection_set(idx)
+        item = self._items[idx]
+        item.rotation = degrees
+        item.thumbnail = None
+        self._refresh_list(select_id=item.id)
 
     # ── Browse ────────────────────────────────────────────────────────────────
 
@@ -619,6 +722,33 @@ class App(tk.Tk):
                 "No images", "Add at least one image before converting."
             )
             return
+
+        outdir = self.outdir_var.get().strip() or os.getcwd()
+        custom = self.fname_var.get().strip()
+        fname = (
+            (custom[:-4] if custom.lower().endswith(".pdf") else custom) + ".pdf"
+            if custom
+            else self._make_filename()
+        )
+        out_path = os.path.join(outdir, fname)
+
+        if os.path.exists(out_path):
+            if not messagebox.askyesno(
+                "File exists",
+                f'"{fname}" already exists in that folder.\n\nOverwrite it?',
+            ):
+                return
+
+        core.save_settings(self._current_settings())
+
+        # Read every Tk variable here, on the main thread — _run() executes on
+        # a background thread, and Tkinter variables aren't safe to touch from
+        # anywhere else.
+        quality = self._quality_var.get()
+        target_page = PAGE_SIZES[self.pagesize_var.get()]
+        pg_label = self.pagesize_var.get().split("(")[0].strip()
+        image_format = "png" if self.format_var.get().startswith("PNG") else "jpeg"
+
         self._log.configure(state="normal")
         self._log.delete("1.0", "end")
         self._log.configure(state="disabled")
@@ -627,26 +757,17 @@ class App(tk.Tk):
         self._convert_btn.config(state="disabled", text="Converting…", bg="#2a2d3a")
         self._cancel_btn.config(state="normal")
         items_snapshot = list(self._items)
-        threading.Thread(target=self._run, args=(items_snapshot,), daemon=True).start()
+        threading.Thread(
+            target=self._run,
+            args=(items_snapshot, out_path, fname, quality, target_page, pg_label, image_format),
+            daemon=True,
+        ).start()
 
-    def _run(self, items):
+    def _run(self, items, out_path, fname, quality, target_page, pg_label, image_format):
         start_t = time.time()
         total = len(items)
-        quality = self._quality_var.get()
-        target_page = PAGE_SIZES[self.pagesize_var.get()]
 
-        # ── Duplicate detection ──
-        seen, dups = {}, []
-        for item in items:
-            try:
-                h = md5_of(item.path)
-                if h in seen:
-                    dups.append((item.name, seen[h]))
-                else:
-                    seen[h] = item.name
-            except Exception:
-                pass
-
+        dups = core.find_duplicates(items)
         if dups:
             msg = "\n".join(f"  • {b} ≡ {a}" for b, a in dups[:5])
             if len(dups) > 5:
@@ -667,22 +788,12 @@ class App(tk.Tk):
                 self.after(0, lambda: self._finish_cancelled(None))
                 return
 
-        # Build output path
-        outdir = self.outdir_var.get().strip() or os.getcwd()
-        custom = self.fname_var.get().strip()
-        fname = (
-            (custom[:-4] if custom.lower().endswith(".pdf") else custom) + ".pdf"
-            if custom
-            else self._make_filename()
-        )
-        out_path = os.path.join(outdir, fname)
-
-        pg_label = self.pagesize_var.get().split("(")[0].strip()
+        fmt_label = "PNG (lossless)" if image_format == "png" else f"JPEG q{quality}"
         self.after(
             0,
             lambda: self._log_write(
                 f"Converting {total} page(s) → {fname}   "
-                f"[quality={quality}, size={pg_label}]",
+                f"[{fmt_label}, size={pg_label}]",
                 "hi",
             ),
         )
@@ -694,69 +805,37 @@ class App(tk.Tk):
                 ),
             )
 
-        errors, processed = [], 0
-
-        try:
-            c = canvas.Canvas(out_path)
-            for i, item in enumerate(items, 1):
-                if self._cancel_flag.is_set():
-                    self.after(0, lambda: self._finish_cancelled(out_path))
-                    return
-
-                pct = (i / total) * 100
+        def on_progress(i, tot, item, success, err):
+            pct = (i / tot) * 100
+            self.after(
+                0,
+                lambda n=item.name, p=pct, idx=i: self._set_status(
+                    f"[{idx}/{tot}]  {n}", p
+                ),
+            )
+            if success:
+                self.after(0, lambda n=item.name: self._log_write(f"  ✓  {n}", "ok"))
+            else:
                 self.after(
                     0,
-                    lambda n=item.name, p=pct, idx=i: self._set_status(
-                        f"[{idx}/{total}]  {n}", p
+                    lambda n=item.name, e=err: self._log_write(
+                        f"  ✗  {n}: {e}", "err"
                     ),
                 )
 
-                try:
-                    with Image.open(item.path) as raw:
-                        img = fix_image(raw.copy())
-                    if item.rotation:
-                        img = rotate_pil(img, item.rotation)
-
-                    img_w, img_h = img.size
-
-                    if target_page is None:
-                        page_w, page_h = float(img_w), float(img_h)
-                        draw_x, draw_y, draw_w, draw_h = 0.0, 0.0, page_w, page_h
-                    else:
-                        page_w, page_h = target_page
-                        scale = min(page_w / img_w, page_h / img_h)
-                        draw_w = img_w * scale
-                        draw_h = img_h * scale
-                        draw_x = (page_w - draw_w) / 2
-                        draw_y = (page_h - draw_h) / 2
-
-                    c.setPageSize((page_w, page_h))
-
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".jpg", delete=False
-                    ) as tmp:
-                        tmp_path = tmp.name
-                    img.save(tmp_path, format="JPEG", quality=quality)
-                    c.drawImage(tmp_path, draw_x, draw_y, width=draw_w, height=draw_h)
-                    os.unlink(tmp_path)
-
-                    c.showPage()
-                    processed += 1
-                    self.after(
-                        0, lambda n=item.name: self._log_write(f"  ✓  {n}", "ok")
-                    )
-
-                except Exception as e:
-                    errors.append((item.name, str(e)))
-                    self.after(
-                        0,
-                        lambda n=item.name, err=str(e): self._log_write(
-                            f"  ✗  {n}: {err}", "err"
-                        ),
-                    )
-
-            c.save()
-
+        try:
+            processed, errors = core.build_pdf(
+                items,
+                out_path,
+                quality=quality,
+                page_size=target_page,
+                image_format=image_format,
+                on_progress=on_progress,
+                cancel_event=self._cancel_flag,
+            )
+        except core.Cancelled:
+            self.after(0, lambda: self._finish_cancelled(out_path))
+            return
         except Exception as e:
             self.after(0, lambda: self._finish_error(f"Fatal error: {e}"))
             return
@@ -770,7 +849,7 @@ class App(tk.Tk):
         self._log_write("")
         self._log_write(
             f"  ✓  {processed} page{'s' if processed != 1 else ''} written   "
-            f"│  {format_size(out_path)}   │  {elapsed:.2f}s",
+            f"│  {core.format_size(out_path)}   │  {elapsed:.2f}s",
             "ok",
         )
         self._log_write(f"  ↳  {out_path}", "hi")

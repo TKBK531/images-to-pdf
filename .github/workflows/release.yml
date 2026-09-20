@@ -13,13 +13,10 @@ jobs:
         include:
           - os: windows-latest
             asset_name: ImagesToPDF-windows.exe
-            built_path: dist/ImagesToPDF.exe
           - os: macos-latest
-            asset_name: ImagesToPDF-macos
-            built_path: dist/ImagesToPDF
+            asset_name: ImagesToPDF-macos.zip
           - os: ubuntu-latest
             asset_name: ImagesToPDF-linux
-            built_path: dist/ImagesToPDF
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,12 +32,45 @@ jobs:
       - name: Install package and PyInstaller
         run: pip install ".[build]"
 
-      - name: Build standalone executable
+      - name: Generate app icon
+        run: python scripts/make_icon.py
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --windowed --name ImagesToPDF --icon icon.ico run.py
+
+      # Inert until WINDOWS_CERT_BASE64 / WINDOWS_CERT_PASSWORD secrets are
+      # added to the repo — see README's "Code signing" section. Without
+      # them, this step is skipped and the build stays unsigned (current
+      # behavior: Windows shows a SmartScreen warning on first run).
+      - name: Sign Windows executable (optional)
+        if: runner.os == 'Windows' && secrets.WINDOWS_CERT_BASE64 != ''
+        uses: dlemstra/code-sign-action@v1
+        with:
+          certificate: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          password: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          folder: dist
+
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp dist/ImagesToPDF.exe "${{ matrix.asset_name }}"
+
+      - name: Build app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller --windowed --name ImagesToPDF --icon icon.icns run.py
+
+      - name: Zip app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/ImagesToPDF.app" "${{ matrix.asset_name }}"
+
+      - name: Build executable (Linux)
+        if: runner.os == 'Linux'
         run: pyinstaller --onefile --windowed --name ImagesToPDF run.py
 
-      - name: Rename artifact
-        shell: bash
-        run: cp "${{ matrix.built_path }}" "${{ matrix.asset_name }}"
+      - name: Rename artifact (Linux)
+        if: runner.os == 'Linux'
+        run: cp dist/ImagesToPDF "${{ matrix.asset_name }}"
 
       - uses: actions/upload-artifact@v4
         with:
