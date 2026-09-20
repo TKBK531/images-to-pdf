@@ -27,6 +27,8 @@ Every [release](../../releases) has prebuilt binaries for:
 
 Download the one for your OS and run it directly.
 
+> **Windows SmartScreen warning:** since this app isn't code-signed, Windows will show a "Windows protected your PC" prompt the first time you run it. This is normal for small/independent apps, not a sign of a problem — click **More info**, then **Run anyway**. It only appears once per download.
+
 ## Run from source
 
 Requires Python 3.9+.
