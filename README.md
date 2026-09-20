@@ -58,7 +58,7 @@ python -m images_to_pdf
 
 ```bash
 pip install ".[build]"
-pyinstaller --onefile --windowed --name ImagesToPDF src/images_to_pdf/__main__.py
+pyinstaller --onefile --windowed --name ImagesToPDF run.py
 ```
 
 The binary is written to `dist/`.
