@@ -1,0 +1,61 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: ImagesToPDF-windows.exe
+            built_path: dist/ImagesToPDF.exe
+          - os: macos-latest
+            asset_name: ImagesToPDF-macos
+            built_path: dist/ImagesToPDF
+          - os: ubuntu-latest
+            asset_name: ImagesToPDF-linux
+            built_path: dist/ImagesToPDF
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tk (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install package and PyInstaller
+        run: pip install ".[build]"
+
+      - name: Build standalone executable
+        run: pyinstaller --onefile --windowed --name ImagesToPDF src/images_to_pdf/__main__.py
+
+      - name: Rename artifact
+        shell: bash
+        run: cp "${{ matrix.built_path }}" "${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Attach binaries to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
