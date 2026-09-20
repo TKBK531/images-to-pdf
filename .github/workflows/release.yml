@@ -18,6 +18,8 @@ jobs:
           - os: ubuntu-latest
             asset_name: ImagesToPDF-linux
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERT_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +46,7 @@ jobs:
       # them, this step is skipped and the build stays unsigned (current
       # behavior: Windows shows a SmartScreen warning on first run).
       - name: Sign Windows executable (optional)
-        if: runner.os == 'Windows' && secrets.WINDOWS_CERT_BASE64 != ''
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
         uses: dlemstra/code-sign-action@v1
         with:
           certificate: ${{ secrets.WINDOWS_CERT_BASE64 }}
